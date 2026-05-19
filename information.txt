@@ -1,0 +1,104 @@
+What Problem Does It Solve?
+Every early stage startup (5–20 people) has the same invisible problem:
+Things fall through the cracks — and nobody notices until it's too late.
+Specifically:
+
+A critical bug ticket sits in Linear for 6 days unassigned
+A product spec in Notion is 3 months outdated but the team is still referencing it
+The same question gets asked in Slack every week but nobody has written the answer down
+A PR has been waiting for review for 4 days blocking an entire feature
+A founder is in back to back meetings and has no idea what their team actually shipped this week
+
+No single person's fault. Just the natural chaos of a small fast-moving team with too many tools and not enough ops bandwidth.
+OpsPilot is the ops person the startup can't afford to hire yet.
+
+Who Uses It?
+Primary user: The founder or CTO of a 5–25 person startup
+They're technical enough to connect their tools. They're busy enough that they miss things constantly. They care deeply about velocity and nothing frustrates them more than invisible blockers.
+Secondary user: Engineering lead or team lead
+Wants visibility into team progress without micromanaging. Wants blockers surfaced before standup not during.
+Who doesn't use it:
+
+Large companies with dedicated ops/project managers
+Solo founders with no team yet
+Non-technical founders who don't use Linear/GitHub
+
+What Does It Actually Do Day-to-Day?
+Every morning at 9am — Daily Briefing
+OpsPilot sends a Slack message to the founder:
+Good morning. Here's what needs your attention today:
+
+🔴 URGENT
+→ PR #47 (auth refactor) has been open 5 days
+   Last reviewer: nobody assigned
+   Blocking: mobile login feature
+
+→ "Q4 Roadmap" Notion doc hasn't been updated in 47 days
+   Still being referenced in 3 active tickets
+
+🟡 WATCH
+→ 3 Linear tickets moved to "In Progress" 8+ days ago
+   No updates, no comments
+
+✅ SHIPPED THIS WEEK
+→ 4 PRs merged
+→ 2 tickets closed
+→ API response time improved (from commit messages)
+
+One thing I'd suggest: assign PR #47 before standup.
+Every evening at 6pm — End of Day Pulse
+Shorter. What moved today. What didn't. What's at risk tomorrow.
+On demand — Ask OpsPilot anything
+Via Slack: "OpsPilot what's blocking the payment feature?"
+It searches Linear, Notion, GitHub and answers in 30 seconds.
+Weekly — Sunday evening digest
+Full week summary. Velocity trends. Recurring patterns. "This is the third week in a row that backend tickets have stalled on Friday."
+
+What Does Multi-Agent Mean Here?
+Not buzzword. Actual reason.
+One single AI prompt cannot reliably do all of this because each task requires different reasoning:
+Collector Agent — "Go get the data"
+Knows how to talk to APIs. Pulls from Linear, Notion, GitHub, Slack. Formats everything consistently. Runs on a schedule. Doesn't reason — just fetches and structures.
+Analyst Agent — "What does this data mean?"
+Takes everything Collector fetched. Uses Gemini's long context to read across all sources simultaneously. Finds patterns humans miss — "this ticket has been reassigned 4 times" or "this doc is referenced everywhere but never updated."
+Decision Agent — "What actually matters right now?"
+Not everything the Analyst finds is worth bothering the founder about. This agent applies priority logic — urgency, impact, who needs to act. Filters noise. Decides what goes in the briefing vs what gets silently logged.
+Action Agent — "Do something about it"
+Takes the Decision agent's output and either sends a Slack message, creates a Linear ticket, drafts a Notion update, or just logs it. This is the agent that makes OpsPilot feel alive rather than just a dashboard.
+Why LangGraph specifically:
+Each agent maintains state between runs. The Decision agent remembers what it flagged yesterday so it doesn't repeat itself. The Analyst agent builds a picture of the team's patterns over time. This memory and state is what LangGraph handles elegantly — it's not possible to do this well with a single stateless prompt chain.
+
+Main Inputs
+Connected Tools (pulled automatically):
+
+Linear — tickets, assignees, status, last updated, comments
+Notion — pages, last edited date, who's referencing what
+GitHub — PRs, review status, commit messages, branch age
+Slack — specific channels (not all messages, just selected ones)
+
+Configuration (set once by founder):
+
+What counts as "stale" — 3 days? 5 days?
+Which Linear projects to monitor
+Which Notion workspace sections matter
+Which GitHub repos
+What time to send briefings
+Who to notify for what type of alert
+
+Implicit inputs over time:
+
+Historical patterns — what the team's normal velocity looks like
+Previous flags — what was already surfaced so it doesn't repeat
+Founder feedback — "this type of alert isn't useful" teaches the system
+
+Expected Outputs
+1. Daily Slack Briefing
+Structured, prioritized, actionable. Not a data dump — a decision brief. Founder reads it in 90 seconds and knows exactly what needs their attention.
+2. On-Demand Answers
+Ask in Slack, get an answer in seconds. Replaces 15 minutes of tab switching across 4 tools.
+3. Auto-Created Tickets
+If a recurring Slack question has no Linear ticket — OpsPilot creates one automatically. If a PR has been unreviewed 5 days — creates a reminder ticket and assigns it.
+4. Weekly Trend Report
+Exportable PDF (you already built a PDF engine in NeuroNest — reuse it). Shows velocity trends, recurring blockers, team patterns. Something a founder can share with investors.
+5. Notion Auto-Updates
+Flags stale docs and optionally drafts an updated summary based on recent Linear tickets and GitHub activity. Founder approves before it goes live.

@@ -1,0 +1,319 @@
+════════════════════════════════════════════════════════════════════════
+  OPSPILOT — STEP 1 DETAILED BREAKDOWN
+  What was built inside app/core/
+════════════════════════════════════════════════════════════════════════
+
+OVERVIEW
+────────
+Step 1 built the "core" layer of the application — the foundation that
+every other part of the codebase (agents, integrations, API, scheduler)
+will rely on. Nothing in core knows about Linear or Slack or LangGraph.
+It only knows about configuration, logging, and shared vocabulary.
+
+Three files were created:
+  1. app/core/config.py
+  2. app/core/logging.py
+  3. app/core/constants.py
+
+Plus one test file:
+  4. tests/test_config.py
+
+And main.py was updated to use the new logging setup.
+
+────────────────────────────────────────────────────────────────────────
+FILE 1 — app/core/config.py
+────────────────────────────────────────────────────────────────────────
+
+WHAT IT IS:
+  The single place where OpsPilot reads its configuration from the
+  environment. Every secret, every API key, every threshold value is
+  defined here as a typed field. No other file in the app should ever
+  call os.environ or os.getenv directly.
+
+WHY PYDANTIC-SETTINGS:
+  pydantic-settings is a library that extends Pydantic (the same library
+  FastAPI uses for request validation) to also read from .env files and
+  environment variables. The benefit is that every value is:
+    - Type-checked at startup (wrong type = crash immediately, not later)
+    - Validated (e.g. app_env must be "development", "staging", or
+      "production" — anything else raises a clear error)
+    - Documented in one place
+
+HOW IT WORKS:
+  The Settings class inherits from BaseSettings. Each attribute is a
+  typed Python field. When Settings() is instantiated, pydantic-settings
+  automatically:
+    1. Reads the .env file
+    2. Reads actual environment variables
+    3. Merges them (env vars win over .env file values)
+    4. Validates every field
+    5. Raises a ValidationError with a clear message if anything is wrong
+
+WHAT FIELDS WERE DEFINED:
+  App-level:
+    - app_env       → must be "development", "staging", or "production"
+    - secret_key    → required string, used for signing tokens
+    - log_level     → must be one of DEBUG/INFO/WARNING/ERROR/CRITICAL
+
+  Database:
+    - database_url  → full async PostgreSQL connection string
+
+  Gemini / LLM:
+    - google_api_key → your Google AI Studio key
+    - gemini_model   → defaults to "gemini-1.5-pro"
+
+  Slack:
+    - slack_bot_token      → the xoxb-... bot token
+    - slack_signing_secret → used to verify incoming Slack requests
+    - slack_channel_id     → which channel to post briefings to
+
+  Linear:
+    - linear_api_key → lin_api_... token
+    - linear_team_id → which team's tickets to monitor
+
+  Notion:
+    - notion_api_key      → secret_... integration token
+    - notion_workspace_id → which workspace to read from
+
+  GitHub:
+    - github_token     → ghp_... personal access token
+    - github_org       → org or username that owns the repos
+    - github_repos_raw → raw comma-separated string from .env
+      + github_repos   → Python property that parses the above into a
+                         proper list: "repo-a,repo-b" → ["repo-a","repo-b"]
+
+  Scheduler (cron expressions):
+    - daily_briefing_cron → "0 9 * * *"  (9:00 AM daily)
+    - eod_pulse_cron      → "0 18 * * *" (6:00 PM daily)
+    - weekly_digest_cron  → "0 18 * * 0" (Sunday 6 PM)
+
+  Staleness thresholds (in days):
+    - stale_ticket_days     → 5
+    - stale_pr_days         → 4
+    - stale_notion_doc_days → 30
+
+DERIVED PROPERTIES:
+  Two convenience properties were added that compute a boolean from
+  app_env so that code elsewhere can write:
+    if settings.is_production:
+        ...
+  instead of:
+    if settings.app_env == "production":
+        ...
+
+THE SINGLETON PATTERN:
+  get_settings() is decorated with @lru_cache(maxsize=1). This means
+  the .env file is parsed exactly ONCE per Python process. Every module
+  that calls get_settings() gets the same object back from cache.
+
+  There is also a _SettingsProxy class. This is a lazy wrapper — it
+  looks like a Settings object but it doesn't actually call get_settings()
+  until you access an attribute on it. This was necessary because:
+    - At the bottom of the file, we write: settings = _SettingsProxy()
+    - When you run tests and import from app.core.config, that line runs
+    - Without the proxy, it would call get_settings() immediately, which
+      would try to load .env, fail because .env doesn't exist, and crash
+      before any test could even start
+    - With the proxy, nothing happens at import time — the settings only
+      load when you actually access settings.something in real app code
+
+  In tests, you instantiate Settings(**your_test_values) directly, which
+  bypasses get_settings() entirely.
+
+────────────────────────────────────────────────────────────────────────
+FILE 2 — app/core/logging.py
+────────────────────────────────────────────────────────────────────────
+
+WHAT IT IS:
+  The logging setup for the entire application. Call configure_logging()
+  once at startup and from then on every log message anywhere in the app
+  is automatically formatted consistently.
+
+WHY STRUCTLOG:
+  Python's built-in logging module outputs plain text strings like:
+    2024-01-15 09:00:00 INFO mymodule Some message happened
+
+  structlog outputs structured key-value pairs:
+    {"event": "ticket_fetched", "source": "linear", "count": 42, "timestamp": "..."}
+
+  In development this is rendered as pretty coloured output.
+  In production it's JSON — which can be ingested by log management tools
+  (Datadog, GCP Cloud Logging, Grafana Loki) and searched/filtered.
+
+HOW configure_logging() WORKS:
+  1. Reads the log level from settings (e.g. INFO)
+  2. Sets up a list of "processors" — functions that run on every log
+     event in order. These add timestamps, log levels, logger names, etc.
+  3. In development: uses ConsoleRenderer (pretty, coloured output)
+  4. In production: uses JSONRenderer (one JSON object per log line)
+  5. Clears any existing handlers and sets up a fresh StreamHandler
+     writing to stdout
+  6. Quiets down noisy third-party libraries (httpx, httpcore,
+     uvicorn.access) so they only log warnings and above
+
+HOW TO USE IT:
+  At the top of any file in the app:
+    from app.core.logging import get_logger
+    log = get_logger(__name__)
+
+  Then log structured events:
+    log.info("briefing_sent", channel="#ops-pilot", items=3)
+    log.warning("stale_pr_detected", repo="api", pr_number=47, days_open=5)
+    log.error("linear_fetch_failed", error=str(e))
+
+  The key-value pairs make it easy to search logs later:
+  "show me all events where days_open > 4" becomes a simple filter.
+
+WHERE IT'S CALLED:
+  main.py was updated to use a lifespan handler — an async context
+  manager that FastAPI calls when the server starts. configure_logging()
+  is the very first thing called there, before any request is processed.
+
+────────────────────────────────────────────────────────────────────────
+FILE 3 — app/core/constants.py
+────────────────────────────────────────────────────────────────────────
+
+WHAT IT IS:
+  All the domain-specific enums and named constants for OpsPilot in one
+  place. No business logic here — just names.
+
+WHY ENUMS:
+  Without enums, code would be full of raw strings like:
+    if agent == "collector": ...
+    if source == "linear": ...
+    if severity == "urgent": ...
+
+  Raw strings are error-prone. If you typo "collecor" somewhere, Python
+  won't tell you — the condition just silently fails. With enums:
+    if agent == AgentName.COLLECTOR: ...
+  If you typo AgentName.COLLECOR, Python raises AttributeError immediately.
+
+  Enums also make it easy to change a name in one place rather than
+  find-and-replace across the whole codebase.
+
+PYTHON 3.10 COMPATIBILITY NOTE:
+  StrEnum (a string enum that behaves like a plain string) was added in
+  Python 3.11. The project is running Python 3.10.6. Rather than
+  upgrading Python or using a third-party package, a simple shim was
+  added at the top of constants.py:
+    class StrEnum(str, Enum): ...
+  This gives identical behaviour — the enum members are real strings
+  (AgentName.COLLECTOR == "collector" is True) on any Python version.
+
+ENUMS DEFINED:
+
+  AgentName — the four agents in the pipeline:
+    COLLECTOR → "collector"
+    ANALYST   → "analyst"
+    DECISION  → "decision"
+    ACTION    → "action"
+
+  DataSource — the four integrated tools:
+    LINEAR → "linear"
+    NOTION → "notion"
+    GITHUB → "github"
+    SLACK  → "slack"
+
+  Severity — how urgent is this finding:
+    URGENT → "urgent"  (🔴 needs founder action today)
+    WATCH  → "watch"   (🟡 monitor, may escalate)
+    INFO   → "info"    (✅ positive signal / shipped)
+
+  BriefingType — what kind of report is this:
+    DAILY_MORNING → "daily_morning"  (9 AM brief)
+    EOD_PULSE     → "eod_pulse"      (6 PM pulse)
+    WEEKLY_DIGEST → "weekly_digest"  (Sunday digest)
+    ON_DEMAND     → "on_demand"      (triggered by Slack query)
+
+  StaleType — what category of staleness was detected:
+    TICKET     → "stale_ticket"
+    PR         → "stale_pr"
+    NOTION_DOC → "stale_notion_doc"
+
+  ActionType — what the Action agent can do:
+    SEND_SLACK_MESSAGE   → "send_slack_message"
+    CREATE_LINEAR_TICKET → "create_linear_ticket"
+    DRAFT_NOTION_UPDATE  → "draft_notion_update"
+    LOG_ONLY             → "log_only"
+
+────────────────────────────────────────────────────────────────────────
+FILE 4 — tests/test_config.py
+────────────────────────────────────────────────────────────────────────
+
+11 unit tests were written and all 11 passed.
+
+Tests for Settings (config.py):
+  test_settings_load_minimal
+    → Proves Settings loads successfully with the minimum required fields
+    → Checks defaults are correct (app_env=development, gemini_model=...)
+
+  test_github_repos_parsed
+    → Passes "repo-a,repo-b, repo-c" as the raw string
+    → Asserts github_repos == ["repo-a", "repo-b", "repo-c"]
+    → Tests whitespace stripping
+
+  test_github_repos_empty
+    → Passes "" as the raw string
+    → Asserts github_repos == []
+
+  test_is_production_flag
+    → Sets app_env="production"
+    → Asserts is_production is True, is_development is False
+
+  test_is_development_flag
+    → Uses default app_env="development"
+    → Asserts is_development is True, is_production is False
+
+  test_invalid_app_env_raises
+    → Passes app_env="nonsense"
+    → Asserts ValidationError is raised (pydantic rejects it)
+
+  test_invalid_log_level_raises
+    → Passes log_level="VERBOSE" (not a valid level)
+    → Asserts ValidationError is raised
+
+Tests for Constants (constants.py):
+  test_agent_name_values   → All four AgentName values are correct strings
+  test_severity_values     → All three Severity values are correct strings
+  test_briefing_type_values → spot-check two BriefingType values
+  test_data_source_values  → spot-check two DataSource values
+
+────────────────────────────────────────────────────────────────────────
+WHAT MAIN.PY GOT CHANGED
+────────────────────────────────────────────────────────────────────────
+
+Before:
+  app = FastAPI(title="OpsPilot", ...)
+
+After:
+  A lifespan async context manager was added. FastAPI's lifespan pattern
+  is the recommended way to run startup/shutdown logic. It replaced the
+  old on_event("startup") pattern.
+
+  @asynccontextmanager
+  async def lifespan(app):
+      configure_logging()   ← logging is set up before first request
+      log.info("opspilot_startup")
+      yield                 ← app runs here
+      log.info("opspilot_shutdown")
+
+  app = FastAPI(..., lifespan=lifespan)
+
+────────────────────────────────────────────────────────────────────────
+HOW EVERYTHING CONNECTS
+────────────────────────────────────────────────────────────────────────
+
+  main.py
+    ├── on startup → configure_logging()         (from core/logging.py)
+    │
+  any agent / integration / API route
+    ├── from app.core.config import settings      → read any config value
+    ├── from app.core.logging import get_logger   → structured log
+    └── from app.core.constants import Severity   → use named enum
+
+  Nothing in core imports from agents/, integrations/, api/, etc.
+  The dependency arrow only points inward → core is a leaf with no deps.
+
+════════════════════════════════════════════════════════════════════════
+END OF STEP 1 EXPLANATION
+════════════════════════════════════════════════════════════════════════

@@ -1,0 +1,20 @@
+Integrations,,
+Phase 1 — Core (build these first),,
+Tool,What OpsPilot reads,What OpsPilot writes
+Linear ,"Tickets, status, assignees, comments","Creates tickets, adds comments"
+Notion,"Pages, last edited, content",Drafts updates (with approval)
+GitHub,"PRs, commits, reviews, branches",None (read only)
+Slack,Selected channels,Sends briefings and alerts
+,,
+Phase 2 — Growth ,,
+Tool,Purpose,
+Google Drive,Reads shared docs and decks,
+Jira,Alternative to Linear for some startups,
+GitHub Issues,For startups not using Linear,
+Email digest,For founders not on Slack,
+,,
+Phase 3 — Vision,,
+Tool,Purpose,
+Calendar API,"Knows when founder is in meetings, adjusts timing",
+Figma,Flags designs that have no corresponding Linear ticket,
+Stripe/Analytics,Connects business metrics to engineering velocity,

@@ -1,0 +1,13 @@
+version: "3.9"
+
+services:
+  opspilot:
+    build: .
+    container_name: opspilot
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    restart: unless-stopped
+    # Use host network on Linux to easily reach a local Supabase if running locally.
+    # On Mac/Windows, host network behaves differently, but standard ports usually work.

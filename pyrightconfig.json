@@ -1,0 +1,8 @@
+{
+  "pythonVersion": "3.10",
+  "pythonPlatform": "Windows",
+  "pythonPath": "C:/Users/vivek/AppData/Local/Programs/Python/Python310/python.exe",
+  "include": ["app", "tests", "main.py"],
+  "exclude": ["**/__pycache__"],
+  "typeCheckingMode": "basic"
+}

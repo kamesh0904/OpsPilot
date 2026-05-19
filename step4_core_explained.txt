@@ -1,0 +1,532 @@
+════════════════════════════════════════════════════════════════════════
+  OPSPILOT — STEP 4  |  3-Question Breakdown for Every File
+  app/graph/ — LangGraph state schema and pipeline wiring
+════════════════════════════════════════════════════════════════════════
+
+
+OVERVIEW
+────────
+Step 4 wired the four agents from Step 3 into a running LangGraph
+pipeline. Nothing new was added to the business logic — the Collector,
+Analyst, Decision, and Action agents are unchanged. What Step 4 adds
+is the infrastructure that connects them: a shared state object, four
+node-function wrappers, a compiled graph, and a single public function
+(run_pipeline) that the scheduler and API will call.
+
+Four files were created:
+  1. app/graph/state.py
+  2. app/graph/pipeline.py
+  3. app/graph/__init__.py   (updated from empty stub)
+  4. tests/test_graph.py
+
+Total new tests: 24 (all passing)
+Cumulative total after Steps 1–4: 101 passing
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE 1 — app/graph/state.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. WHAT DOES THIS FILE DO?
+   Two separate responsibilities live here, kept together because they
+   are both about "what data exists and how it transforms":
+
+   A) OpsState — the TypedDict that LangGraph uses as its graph state.
+
+      TypedDict is the standard Python type for defining the shape of
+      a plain dict. LangGraph's StateGraph requires a TypedDict — not
+      a Pydantic model — because it needs to update state incrementally
+      by merging dicts, which Pydantic models don't support natively.
+
+      Fields defined in OpsState:
+        briefing_type   — "daily_morning" | "eod_pulse" | "weekly_digest"
+                          | "on_demand". Set by the caller before the
+                          graph runs. Read-only inside nodes.
+        enrich_reviews  — bool. Controls whether the GitHub collector
+                          fetches per-PR review decisions (slower, richer).
+        snapshot        — CollectorSnapshot. Written by collector_node,
+                          read by analyst_node.
+        report          — AnalystReport. Written by analyst_node,
+                          read by decision_node.
+        decision        — DecisionOutput. Written by decision_node,
+                          read by action_node.
+        action_result   — ActionResult. Written by action_node.
+                          Final output of the pipeline.
+        run_errors      — list[str]. Accumulated by any node that catches
+                          a non-fatal error (e.g. one source is down).
+        started_at      — ISO timestamp string. Recorded at graph entry.
+                          Used to compute elapsed time in logs.
+
+      All fields are Optional (total=False on the TypedDict) so that
+      early nodes can return partial updates without specifying every key.
+
+   B) make_initial_state() — builds the clean starting state before
+      graph execution begins. Caller passes briefing_type and
+      enrich_reviews; all agent-output fields start as None.
+
+   C) Four async node functions — one per agent.
+
+      LangGraph node functions have a specific contract:
+        - Receive: the full current state dict (OpsState)
+        - Return: a dict containing ONLY the keys the node modified
+        - LangGraph merges the returned dict into the running state
+          before passing it to the next node
+
+      collector_node  → calls CollectorAgent.run(), returns snapshot
+      analyst_node    → calls AnalystAgent.run(), returns report
+      decision_node   → calls DecisionAgent.run(), returns decision
+      action_node     → calls ActionAgent.run(), returns action_result
+
+      Each node follows the same error contract:
+        Non-fatal errors (one source down, Slack hiccup):
+          → appended to run_errors, node returns partial state, graph
+            continues to the next node
+        Fatal errors (no data at all, unrecoverable):
+          → re-raised, LangGraph marks the run as failed, the caller's
+            try/except handles alerting
+
+2. WHY DID WE MAKE IT THIS WAY AND NOT ANOTHER WAY?
+
+   Why TypedDict for OpsState instead of Pydantic (like AgentState)?
+   ──────────────────────────────────────────────────────────────────
+   LangGraph's StateGraph.ainvoke() expects a plain dict or a TypedDict.
+   It updates state by merging dicts — each node returns a partial dict
+   of only the keys it changed. Pydantic models are immutable by default
+   and can't be updated this way. TypedDict gives Python type hints on a
+   plain dict — the best of both worlds.
+
+   AgentState (in agents/models.py) still exists as the Pydantic-based
+   twin used in tests and for type-checking agent inputs/outputs.
+   OpsState is what LangGraph actually uses at runtime. Two separate
+   types, each optimised for its use case.
+
+   Why total=False on the TypedDict?
+   ───────────────────────────────────
+   total=False means all keys are optional (like Optional[T] for every
+   field). Without it, every node would have to return all eight fields
+   even if it only changed one. With total=False, collector_node returns
+   {"snapshot": ..., "run_errors": [...]} and LangGraph merges only those
+   two keys — the other six remain as they were.
+
+   Why keep node functions in state.py instead of pipeline.py?
+   ─────────────────────────────────────────────────────────────
+   pipeline.py is concerned with graph topology (add_node, add_edge,
+   compile). state.py is concerned with what data exists and how nodes
+   transform it. Keeping them separate means you can test every node
+   function in isolation — just call collector_node(some_state_dict) —
+   without constructing the full StateGraph. Tests don't even need to
+   import pipeline.py.
+
+   Why does collector_node override enrich_reviews for EOD pulse?
+   ───────────────────────────────────────────────────────────────
+   The EOD pulse is a lighter check — the founder already got the
+   full review data in the morning briefing. Fetching per-PR review
+   decisions requires one extra API call per open PR. With 20 PRs
+   across 3 repos, that's 20 extra calls adding ~10 seconds to the run.
+   The collector_node detects briefing_type == EOD_PULSE and sets
+   enrich_reviews=False. This logic lives in the node — not in the
+   scheduler — because the node is the only place that knows both the
+   briefing_type (from state) and the agent parameters simultaneously.
+
+   Why do non-fatal errors return a fallback object instead of None?
+   ──────────────────────────────────────────────────────────────────
+   If analyst_node caught an exception and returned {"report": None},
+   decision_node would immediately raise "no report in state" and the
+   entire pipeline fails. Instead, analyst_node returns an empty
+   AnalystReport() — a valid object with no findings. decision_node
+   sees a real object, produces an empty DecisionOutput, and action_node
+   sends a "nothing urgent today" briefing. The founder always gets
+   something, even when the LLM is completely down.
+
+3. WHAT BREAKS IF THIS FILE HAS A BUG?
+
+   Bug: OpsState defined with total=True (default)
+   → Every node must return all 8 keys. collector_node would need to
+     return snapshot, report, decision, action_result, run_errors,
+     briefing_type, enrich_reviews, started_at — even though it only
+     knows about snapshot. This is impossible. The graph fails to run.
+
+   Bug: collector_node does NOT set enrich_reviews=False for EOD pulse
+   → The EOD collector makes 20+ extra GitHub API calls per run.
+   → At GitHub's rate limits (5,000/hour), a large codebase with many
+     PRs could burn through quota in a few EOD runs. Morning runs then
+     hit 403 rate-limit errors. No GitHub data in the morning briefing.
+
+   Bug: analyst_node raises instead of returning empty AnalystReport
+   → Any Gemini failure or parsing error becomes a fatal pipeline error.
+   → The scheduler logs a failed run. The founder gets nothing.
+   → The whole "partial briefing is better than no briefing" design
+     promise is broken by a single LLM API hiccup.
+
+   Bug: node functions return the full state dict instead of only
+        the keys they modified
+   → Nodes earlier in the pipeline overwrite values written by later
+     nodes when LangGraph merges. decision_node's output could
+     overwrite analyst_node's report field with a stale copy. Data
+     corruption in the pipeline state.
+
+   Bug: make_initial_state() initialises run_errors as None instead
+        of an empty list
+   → collector_node does `list(state.get("run_errors", []))` and gets
+     an empty list — safe. But if some node does
+     `state["run_errors"].append(...)` directly on a None value,
+     AttributeError crashes the node. Subtle, hard to reproduce.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE 2 — app/graph/pipeline.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. WHAT DOES THIS FILE DO?
+   Two responsibilities:
+
+   A) _build_graph() — constructs and compiles the LangGraph StateGraph.
+
+      What "build" means:
+        graph = StateGraph(OpsState)
+          → Creates an empty graph that uses OpsState as its state schema.
+
+        graph.add_node("collector", collector_node)
+        graph.add_node("analyst",   analyst_node)
+        graph.add_node("decision",  decision_node)
+        graph.add_node("action",    action_node)
+          → Registers each async node function under a string name.
+            The name is what appears in LangGraph traces and logs.
+
+        graph.set_entry_point("collector")
+          → The graph starts execution at the "collector" node.
+
+        graph.add_edge("collector", "analyst")
+        graph.add_edge("analyst",   "decision")
+        graph.add_edge("decision",  "action")
+        graph.add_edge("action",    END)
+          → Defines the directed edges: a linear chain. No branching
+            in Phase 1. Each node runs exactly once per pipeline call.
+            END is LangGraph's sentinel that terminates execution.
+
+        return graph.compile()
+          → Validates the graph (no orphaned nodes, no missing edges)
+            and returns a CompiledGraph object. Compilation happens once.
+
+   B) run_pipeline() — the single public function for triggering a run.
+
+      Parameters:
+        briefing_type — what kind of run (morning/eod/weekly/ondemand).
+                        Defaults to DAILY_MORNING.
+        enrich_reviews — override the auto-detection. Defaults to None,
+                         which triggers smart defaulting: True for all
+                         run types except EOD_PULSE.
+
+      What it does:
+        1. Determines enrich_reviews if not explicitly passed.
+        2. Calls make_initial_state() to build a clean starting state.
+        3. Calls _pipeline.ainvoke(initial_state) — runs the graph.
+        4. Logs pipeline_start, pipeline_done (with elapsed time).
+        5. Returns the final OpsState dict after all four nodes ran.
+
+      What the caller gets back:
+        state["action_result"]  — did the briefing send?
+        state["run_errors"]     — any non-fatal errors during the run
+        state["snapshot"]       — raw data (for debugging/logging)
+        state["report"]         — what the Analyst found
+        state["decision"]       — what the Decision agent prioritised
+
+   The compiled graph (_pipeline) is a module-level variable — built
+   once when the module is first imported, reused on every call to
+   run_pipeline(). This is intentional (see Why below).
+
+2. WHY DID WE MAKE IT THIS WAY AND NOT ANOTHER WAY?
+
+   Why compile the graph once at module load instead of on each call?
+   ──────────────────────────────────────────────────────────────────
+   Compilation validates the graph topology — it checks for missing
+   edges, orphaned nodes, and misconfigured entry points. Running this
+   validation once at startup means any topology bug is caught
+   immediately when the server starts, not during the 9am briefing run
+   in front of the founder. If compilation fails, the server refuses
+   to start and the developer sees the error immediately.
+
+   The compiled graph is reusable and async-safe. Each call to
+   _pipeline.ainvoke() gets its own copy of the initial state —
+   concurrent runs don't share state. Compiling once and reusing is
+   strictly correct and avoids unnecessary overhead on every tick.
+
+   Why is enrich_reviews auto-defaulted in run_pipeline, not in
+   the caller (scheduler)?
+   ─────────────────────────────────────────────────────────────
+   The scheduler doesn't know the internal details of what "EOD pulse"
+   means for the collector. That knowledge belongs to the pipeline layer.
+   The scheduler says "run an EOD pulse" and run_pipeline figures out
+   the right parameters. This prevents the logic from leaking into every
+   place that might call run_pipeline (scheduler, API routes, tests).
+
+   Why is run_pipeline() async?
+   ─────────────────────────────
+   LangGraph's .ainvoke() is a coroutine — it must be awaited.
+   The entire OpsPilot stack (FastAPI + APScheduler + all agents) runs
+   in a single asyncio event loop. Making run_pipeline() async means
+   it fits naturally into any async caller without blocking the event
+   loop while waiting for API calls to complete.
+
+   Why does run_pipeline() return the full final OpsState instead of
+   just ActionResult?
+   ─────────────────────────────────────────────────────────────────
+   Different callers need different things:
+     - The scheduler only needs to check action_result.briefing_sent
+       to decide whether to log success or failure.
+     - The POST /briefing/trigger API route might want to return
+       a briefing_preview extracted from the decision or report.
+     - Tests need to inspect every field to verify the graph ran
+       correctly.
+   Returning the full state gives all callers what they need without
+   forcing multiple separate return values or DTOs.
+
+3. WHAT BREAKS IF THIS FILE HAS A BUG?
+
+   Bug: _build_graph() is called inside run_pipeline() instead of at
+        module load
+   → The graph is compiled on every single run. Compilation takes
+     ~100ms. At high frequency (on-demand queries) this adds up.
+   → Worse: if compilation fails (topology bug), it fails silently at
+     runtime during the 9am briefing instead of at startup.
+
+   Bug: graph.set_entry_point("collector") is missing
+   → LangGraph doesn't know where to start. It raises a configuration
+     error when compile() is called. The server fails to start.
+   → Error message is cryptic: "No entry point set." Confusing if
+     you're not familiar with LangGraph's API.
+
+   Bug: graph.add_edge("action", END) is replaced with
+        graph.add_edge("action", "collector")
+   → The graph loops forever: collector → analyst → decision → action
+     → collector → analyst → ... The 9am briefing run never terminates.
+   → APScheduler's job timeout eventually kills it. No briefing sent.
+   → The next scheduled tick also gets killed because the process
+     is stuck in the infinite loop.
+
+   Bug: enrich_reviews defaulting logic is inverted
+        (True for EOD, False for morning)
+   → Morning briefing skips PR review enrichment. The founder gets
+     "PR #47 — review: unknown" instead of "PR #47 — review: APPROVED."
+   → EOD pulse fetches reviews, making it slower than morning.
+   → Both runs produce wrong data — morning is missing context,
+     EOD is unnecessarily slow.
+
+   Bug: elapsed time is computed before ainvoke() returns
+   → elapsed is always ~0ms regardless of how long the run took.
+   → Logs show every briefing as 0 seconds. Performance monitoring
+     is useless. Slow runs (e.g. Gemini taking 20s) are invisible.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE 3 — app/graph/__init__.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. WHAT DOES THIS FILE DO?
+   Defines the public API of the graph package. Three things are exported:
+
+     OpsState           — the TypedDict (for callers that want to type-
+                          annotate the state they receive from run_pipeline)
+     make_initial_state — for callers that want to build a custom state
+                          before invoking the graph directly
+     run_pipeline       — the main entry point for all callers
+
+   Without this file, the scheduler would have to write:
+     from app.graph.pipeline import run_pipeline
+     from app.graph.state import OpsState, make_initial_state
+   If we ever rename or split the internal files, every caller breaks.
+   With __init__.py:
+     from app.graph import run_pipeline
+   Internal structure can change freely.
+
+2. WHY DID WE MAKE IT THIS WAY?
+   Same reasoning as integrations/__init__.py and agents/__init__.py:
+   a stable public surface. The scheduler (Step 5) and all API routes
+   only depend on from app.graph import run_pipeline — they never need
+   to know whether pipeline.py and state.py are one file or ten files.
+
+3. WHAT BREAKS IF THIS FILE HAS A BUG?
+
+   Bug: run_pipeline not exported
+   → scheduler/jobs.py fails to import. Server fails to start.
+   → Error: ImportError: cannot import name 'run_pipeline' from
+     'app.graph'. Clear error, easy to fix, but must be caught before
+     deployment.
+
+   Bug: OpsState not exported
+   → API routes that type-annotate the returned state can't import it.
+   → No runtime crash — Python is duck-typed for dicts. But mypy / pyright
+     raises errors on every file that references app.graph.OpsState.
+   → Over time, developers stop type-annotating state and the codebase
+     loses type safety on the most important object in the system.
+
+   Bug: A circular import is introduced (e.g. __init__.py imports from
+        api/ which imports from graph/)
+   → Python refuses to load the module. The entire app fails to start.
+   → This is the most common and painful Python packaging bug.
+     Always import in one direction: api → graph → agents → integrations
+     → core. Never let a lower layer import from a higher layer.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE 4 — tests/test_graph.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. WHAT DOES THIS FILE DO?
+   24 unit tests, zero real API calls, zero LLM calls. All four agents
+   are patched with AsyncMock. Organised into 6 test classes:
+
+   TestOpsState (4 tests)
+     → make_initial_state() defaults (briefing_type, enrich_reviews,
+       all agent fields start as None, run_errors is empty list).
+     → Custom briefing_type is forwarded correctly.
+     → enrich_reviews=False is respected.
+     → started_at is a valid, timezone-aware ISO string.
+
+   TestCollectorNode (4 tests)
+     → Success path: returns snapshot, empty run_errors.
+     → Per-source errors in snapshot.errors appear in run_errors.
+     → EOD pulse: enrich_pr_reviews=False passed to CollectorAgent.run.
+     → Fatal exception from CollectorAgent.run re-raises (not swallowed).
+
+   TestAnalystNode (4 tests)
+     → Success path: returns report.
+     → Missing snapshot (None) raises RuntimeError with clear message.
+     → AnalystAgent.run exception → returns empty AnalystReport + error
+       in run_errors (no crash).
+     → Errors accumulate: existing run_errors are preserved, not
+       overwritten, when a new error is added.
+
+   TestDecisionNode (4 tests)
+     → Success path: returns decision.
+     → Missing report raises RuntimeError.
+     → DecisionAgent.run exception → returns empty DecisionOutput.
+     → briefing_type from state is forwarded to DecisionAgent.run().
+
+   TestActionNode (4 tests)
+     → Success path: returns action_result.
+     → Missing decision raises RuntimeError.
+     → ActionResult.errors are merged into state run_errors.
+     → ActionAgent.run exception → returns failed ActionResult
+       (briefing_sent=False) without crashing.
+
+   TestPipelineModule (4 tests)
+     → Morning briefing state has enrich_reviews=True by default.
+     → EOD pulse state carries the correct briefing_type.
+     → pipeline module has _pipeline and run_pipeline attributes.
+     → Full end-to-end mocked run: all four agents mocked, run_pipeline()
+       called, final state verified — all four agent outputs present,
+       run_errors empty, briefing_sent=True.
+
+2. WHY DID WE MAKE IT THIS WAY AND NOT ANOTHER WAY?
+
+   Why mock all four agents instead of testing with real ones?
+   ─────────────────────────────────────────────────────────────
+   Real agents require:
+     - Real API keys (not in CI)
+     - Network access (flaky in tests)
+     - Gemini API (slow, costs money, has rate limits)
+     - A real Slack channel to post to
+   Mocking lets us test the graph wiring completely — does collector_node
+   call CollectorAgent.run? Does analyst_node crash when snapshot is None?
+   Does action_node accumulate errors correctly? — without any external
+   dependency. The agents themselves are tested in test_agents.py.
+   test_graph.py tests the graph layer only.
+
+   Why test the "missing state field" cases (no snapshot, no report)?
+   ──────────────────────────────────────────────────────────────────
+   These cases can't happen in a correctly-wired graph (collector always
+   runs before analyst). But they CAN happen if:
+     - Someone adds a new graph entry point that skips collector.
+     - A test calls analyst_node directly with an incomplete state.
+     - LangGraph introduces a bug in its state merging.
+   Testing these cases ensures the nodes fail with a clear, descriptive
+   error ("Analyst node received no snapshot — collector may have failed")
+   rather than an AttributeError deep inside AnalystAgent with no context.
+
+   Why test that errors accumulate (not overwrite)?
+   ──────────────────────────────────────────────────
+   run_errors is a list that every node appends to. If a node
+   accidentally did errors = [new_error] instead of errors.append(),
+   it would overwrite the previous node's errors. A test that starts
+   with one pre-existing error and checks that two errors exist after
+   the node runs catches this regression exactly.
+
+   Why test the end-to-end mocked pipeline in TestPipelineModule?
+   ───────────────────────────────────────────────────────────────
+   Individual node tests verify each node in isolation. But they don't
+   test that the graph is wired correctly — that collector actually runs
+   before analyst, that the state flows through all four nodes, and that
+   the final state contains all four outputs. The end-to-end mocked test
+   is the only test that exercises the compiled graph's ainvoke() path.
+   Without it, a misconfigured edge (e.g. analyst → action, skipping
+   decision) would pass all individual node tests but fail in production.
+
+3. WHAT BREAKS IF THIS FILE HAS A BUG?
+
+   Bug: Mocks use MagicMock instead of AsyncMock for async methods
+   → When collector_node calls CollectorAgent.run(), it awaits the
+     result. MagicMock is not awaitable. Python raises TypeError:
+     object MagicMock is not awaitable. All async tests fail immediately.
+   → This is already correct in our tests (we use AsyncMock throughout).
+     Worth knowing it must stay that way.
+
+   Bug: TestAnalystNode doesn't reset the analyst_node error path test
+        between runs
+   → run_errors from one test bleeds into the next via the shared
+     state dict. Test isolation breaks. Tests fail randomly depending
+     on run order. Our tests avoid this by always building fresh state
+     with make_initial_state() inside each test.
+
+   Bug: The end-to-end test patches app.agents.collector.CollectorAgent.run
+        instead of app.graph.state.CollectorAgent.run
+   → The patch targets the wrong module. The node function still calls
+     the real CollectorAgent.run, which tries to connect to Linear/GitHub/
+     Notion with fake credentials from conftest.py. The test fails with
+     a network or auth error, not a useful assertion failure.
+   → Always patch where the name is looked up (app.graph.state), not
+     where it's defined (app.agents.collector).
+
+   Bug: @pytest.mark.asyncio missing from async test methods
+   → pytest-asyncio doesn't run them as coroutines. They pass trivially
+     without executing any code — the awaited function is never called.
+   → All 20 async tests show PASSED but nothing was actually tested.
+     The graph could be completely broken and these tests wouldn't catch it.
+
+════════════════════════════════════════════════════════════════════════
+HOW EVERYTHING CONNECTS
+════════════════════════════════════════════════════════════════════════
+
+  Dependency arrow points downward — lower layers never import from
+  higher layers:
+
+  app/api/ (Step 5+)
+    └── from app.graph import run_pipeline    ← calls the pipeline
+
+  app/scheduler/ (Step 5)
+    └── from app.graph import run_pipeline    ← calls the pipeline
+
+  app/graph/pipeline.py
+    └── from app.graph.state import (         ← imports node functions
+          OpsState, make_initial_state,            and state schema
+          collector_node, analyst_node,
+          decision_node, action_node)
+
+  app/graph/state.py
+    ├── from app.agents.collector import CollectorAgent
+    ├── from app.agents.analyst   import AnalystAgent
+    ├── from app.agents.decision  import DecisionAgent
+    └── from app.agents.action    import ActionAgent
+
+  app/agents/ (Step 3)          ← agents are unchanged
+  app/integrations/ (Step 2)    ← integrations are unchanged
+  app/core/ (Step 1)            ← core is unchanged
+
+  The graph layer is a thin coordination layer. It adds no business
+  logic — it only decides what order the agents run in, how their
+  errors are surfaced, and what the caller receives back.
+
+════════════════════════════════════════════════════════════════════════
+  END OF STEP 4 EXPLANATION
+  Total tests after Steps 1, 2, 3 & 4: 101 passing (11 + 29 + 37 + 24)
+════════════════════════════════════════════════════════════════════════

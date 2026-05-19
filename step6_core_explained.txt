@@ -1,0 +1,154 @@
+════════════════════════════════════════════════════════════════════════
+  OPSPILOT — STEP 6  |  3-Question Breakdown for Every File
+  app/api/routes/ — FastAPI routes for webhooks, queries, and config
+════════════════════════════════════════════════════════════════════════
+
+
+OVERVIEW
+────────
+Step 6 wraps the core LangGraph pipeline and APScheduler inside a standard
+FastAPI application. It adds the endpoints necessary to interact with
+OpsPilot externally — from triggering briefings manually to asking
+on-demand questions via Slack, and updating thresholds without restarting.
+
+Five files were created or modified:
+  1. app/api/routes/briefing.py     (POST /briefing/trigger)
+  2. app/api/routes/query.py        (POST /query)
+  3. app/api/routes/slack_events.py (POST /slack/events)
+  4. app/api/routes/config.py       (GET & POST /config)
+  5. app/api/routes/__init__.py     (Router assembly)
+  6. tests/test_routes.py           (24 unit tests)
+
+Total new tests: 24 (all passing)
+Cumulative total after Steps 1–6: 145 passing
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE 1 — app/api/routes/briefing.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. WHAT DOES THIS FILE DO?
+   Exposes `POST /briefing/trigger` to manually start a briefing.
+   - Accepts a `run_type` ("morning", "evening", "weekly").
+   - Registers a FastAPI `BackgroundTasks` coroutine that executes
+     `run_pipeline(briefing_type)`.
+   - Returns an immediate 200 OK with a `run_id` before the pipeline finishes.
+   - The actual briefing delivery happens out-of-band via Slack in the Action node.
+
+2. WHY DID WE MAKE IT THIS WAY?
+   Why a background task? The LangGraph pipeline takes 10–30 seconds.
+   If the HTTP request blocked for that long, browsers/clients might time out,
+   and it ties up uvicorn worker threads unnecessarily. Returning instantly
+   gives snappy UX ("Started! Check Slack shortly").
+
+3. WHAT BREAKS IF IT HAS A BUG?
+   Bug: We await the pipeline instead of using `BackgroundTasks`.
+   → The HTTP request blocks for 30s. Client assumes failure.
+   Bug: The background task doesn't have a `try/except`.
+   → An unhandled exception in the background task might crash the worker
+     process, depending on the ASGI server configuration.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE 2 — app/api/routes/query.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. WHAT DOES THIS FILE DO?
+   Exposes `POST /query` for synchronous on-demand question answering.
+   - Triggers `run_pipeline(briefing_type=BriefingType.ON_DEMAND)`.
+   - **Waits** for the pipeline to finish.
+   - Extracts the answer directly from the Decision Output and returns it
+     in the HTTP JSON response, along with the data sources used.
+
+2. WHY DID WE MAKE IT THIS WAY?
+   Unlike the `/briefing/trigger` route, an API consumer calling `/query`
+   (like an internal dashboard or CLI) expects the answer in the HTTP body,
+   not delivered via Slack. The `ON_DEMAND` pipeline path is optimized to be
+   faster (<15s), so blocking the HTTP response is acceptable here.
+
+3. WHAT BREAKS IF IT HAS A BUG?
+   Bug: Failing to extract the answer correctly from the `DecisionOutput`.
+   → Returns an empty string instead of the Gemini response.
+   Bug: The pipeline fails but we don't catch it and return a 503.
+   → Returns a generic 500 Internal Server Error with no helpful context.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE 3 — app/api/routes/slack_events.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. WHAT DOES THIS FILE DO?
+   Exposes `POST /slack/events` — the single webhook for all Slack traffic.
+   - Handles the one-time `url_verification` handshake for Slack setup.
+   - Parses Slash Commands (`/opspilot <question>`) and Event API mentions.
+   - **Crucially:** Verifies the Slack HMAC-SHA256 signature to prevent spoofing.
+   - Uses the "immediate ACK + background task" pattern to beat Slack's 3-second timeout.
+
+2. WHY DID WE MAKE IT THIS WAY?
+   Why the strict 3-second timeout logic?
+   Slack mandates that Slash Commands and Events must be acknowledged (200 OK)
+   within 3 seconds. If not, Slack shows a "Timeout" error to the user, even if
+   we send a message later. By immediately returning `"⏳ Looking into it..."`
+   and firing the pipeline in a background task, we guarantee a fast ACK while
+   allowing the AI all the time it needs to formulate an answer.
+
+3. WHAT BREAKS IF IT HAS A BUG?
+   Bug: Forgetting signature verification.
+   → Anyone on the internet can POST to `/slack/events` and trigger internal
+     database queries, ticket creation, or Slack spam.
+   Bug: Acknowledging *after* running the pipeline.
+   → OpsPilot looks broken to the user ("Timeout error") even though it
+     successfully answers 15 seconds later.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE 4 — app/api/routes/config.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. WHAT DOES THIS FILE DO?
+   Exposes `GET /config` and `POST /config` to read and override settings.
+   - Allows an operator to tweak `stale_ticket_days`, `stale_pr_days`, or
+     the `slack_channel_id` at runtime without restarting the server.
+   - Bypasses the `.env` file for immediate, in-memory overrides.
+
+2. WHY DID WE MAKE IT THIS WAY?
+   In Phase 1, OpsPilot doesn't use a Postgres database for workspace configuration.
+   Settings are loaded from `.env` once at startup. However, operators often
+   need to tune thresholds (e.g. changing stale PR days from 3 to 5) while testing.
+   This route provides a way to hot-reload values into the live `Settings` singleton.
+   (In Phase 2, this route will simply read/write to a Supabase table).
+
+3. WHAT BREAKS IF IT HAS A BUG?
+   Bug: We create a *new* Settings object instead of mutating the singleton.
+   → The API returns the updated config, but the agents (which hold a reference
+     to the singleton) still use the old thresholds.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE 5 — tests/test_routes.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. WHAT DOES THIS FILE DO?
+   Provides 24 unit tests covering all route behaviors using FastAPI's `TestClient`.
+   - Tests valid payload acceptance and Pydantic validation failures (422s).
+   - Tests signature verification success and failure (403s).
+   - Tests HTTP status mappings (e.g. Pipeline errors become 503s).
+   - Entirely mocks the LangGraph pipeline and Scheduler.
+
+2. WHY DID WE MAKE IT THIS WAY?
+   Route tests should only test the HTTP contract: validation, status codes,
+   background task registration, and response shapes. They should NOT test the
+   internal business logic of the agents, which are already heavily tested.
+   Mocking `run_pipeline` makes these tests extremely fast and deterministic.
+
+3. WHAT BREAKS IF IT HAS A BUG?
+   Bug: In the test helper, doing `urgent_items or ["fake item"]` instead of
+   explicitly checking for `None`.
+   → The test for an "empty decision" passes in an empty list, but the helper
+     falsely evaluates `[]` as falsy and injects a fake item. The test fails
+     with an assertion error. (This was a real bug caught and fixed!).
+
+════════════════════════════════════════════════════════════════════════
+  END OF STEP 6 EXPLANATION
+  Total tests after Steps 1–6: 145 passing (11 + 29 + 37 + 24 + 20 + 24)
+════════════════════════════════════════════════════════════════════════
