@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
@@ -31,6 +31,13 @@ from app.core.logging import get_logger
 
 log = get_logger(__name__)
 router = APIRouter()
+
+# Verify API key for protected routes
+def verify_api_key(x_api_key: str = Header(...)):
+    expected = getattr(settings, "api_key", None)
+    if not expected or x_api_key != expected:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API Key")
+    return True
 
 
 # ── Response / Request models ─────────────────────────────────────────────────
@@ -88,6 +95,7 @@ class ConfigUpdateResponse(BaseModel):
     response_model=ConfigResponse,
     summary="Get current OpsPilot configuration",
     tags=["Config"],
+    dependencies=[Depends(verify_api_key)],
 )
 async def get_config() -> ConfigResponse:
     """
@@ -115,6 +123,7 @@ async def get_config() -> ConfigResponse:
     response_model=ConfigUpdateResponse,
     summary="Update OpsPilot configuration",
     tags=["Config"],
+    dependencies=[Depends(verify_api_key)],
 )
 async def update_config(body: ConfigUpdateRequest) -> ConfigUpdateResponse:
     """

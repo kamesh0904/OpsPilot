@@ -29,14 +29,19 @@ class Settings(BaseSettings):
 
     # ── App ──────────────────────────────────────────────────────────────
     app_env: Literal["development", "staging", "production"] = "development"
-    secret_key: str = Field(..., description="Random secret used for signing tokens")
+    secret_key: str = Field("change-me-to-a-random-secret", description="Random secret used for signing tokens")
+    api_key: str = Field("", description="API key required for protected routes")
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
     # ── Database ─────────────────────────────────────────────────────────
     database_url: str = Field(
-        ...,
+        "postgresql+asyncpg://user:password@localhost:5432/opspilot",
         description="Async PostgreSQL DSN, e.g. postgresql+asyncpg://user:pw@host/db",
     )
+
+    # ── Supabase (Optional) ──────────────────────────────────────────────
+    supabase_url: str = Field("", description="Supabase REST API URL")
+    supabase_service_key: str = Field("", description="Supabase Service Role API Key")
 
     # ── Gemini / LLM ─────────────────────────────────────────────────────
     google_api_key: str = Field(..., description="Google AI Studio API key")
