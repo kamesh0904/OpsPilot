@@ -43,7 +43,7 @@ OpsPilot is a multi-agent AI system that monitors Linear, Notion, GitHub, and Sl
 ```
 Good morning. Here's what needs your attention today:
 
-🔴 URGENT
+ URGENT
 → PR #47 (auth refactor) has been open 5 days
    Last reviewer: nobody assigned
    Blocking: mobile login feature
@@ -51,16 +51,16 @@ Good morning. Here's what needs your attention today:
 → "Q4 Roadmap" Notion doc hasn't been updated in 47 days
    Still being referenced in 3 active tickets
 
-🟡 WATCH
+ WATCH
 → 3 Linear tickets moved to "In Progress" 8+ days ago
    No updates, no comments
 
-✅ SHIPPED THIS WEEK
+ SHIPPED THIS WEEK
 → 4 PRs merged
 → 2 tickets closed
 → API response time improved (from commit messages)
 
-💡 One thing I'd suggest: assign PR #47 before standup.
+ One thing I'd suggest: assign PR #47 before standup.
 ```
 
 ---
@@ -493,11 +493,11 @@ Slack slash commands time out if no response is sent within 3 seconds. OpsPilot 
 ```
 User:       /opspilot what's blocking the payment feature?
 
-OpsPilot:   ⏳ Looking into it...          ← sent immediately (< 1s)
+OpsPilot:    Looking into it...          ← sent immediately (< 1s)
 
 [~10 seconds later — message is updated]
 
-OpsPilot:   🔍 Payment feature blockers:
+OpsPilot:    Payment feature blockers:
             → PR #52 "Stripe webhook handler" — open 6 days, no reviewer assigned
             → TICKET-89 "Payment retry logic" — In Progress, assigned to @sarah,
                no update in 4 days
